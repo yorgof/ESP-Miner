@@ -23,6 +23,10 @@
 #define TRANSPORT_TIMEOUT_MS 5000
 #define BUFFER_SIZE 1024
 #define MAX_EXTRANONCE_2_LEN 32
+
+// Set to 1 to use fast-path parser for mining.notify messages, 0 for standard cJSON
+#define USE_FAST_NOTIFY_PARSER 1
+
 static const char * TAG = "stratum_api";
 
 static char * json_rpc_buffer = NULL;
@@ -213,9 +217,155 @@ char * STRATUM_V1_receive_jsonrpc_line(esp_transport_handle_t transport)
     return line;
 }
 
+#if USE_FAST_NOTIFY_PARSER
+// Fast extraction of a quoted string field from JSON, returns malloc'd string or NULL
+static char * fast_extract_string(const char **pos, const char *end) {
+    const char *p = *pos;
+    
+    // Skip whitespace and find opening quote
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+    if (p >= end || *p != '"') return NULL;
+    p++; // skip opening quote
+    
+    const char *start = p;
+    // Find closing quote (simple - doesn't handle escapes, but stratum strings are clean)
+    while (p < end && *p != '"') p++;
+    if (p >= end) return NULL;
+    
+    size_t len = p - start;
+    char *result = malloc(len + 1);
+    if (result) {
+        memcpy(result, start, len);
+        result[len] = '\0';
+    }
+    
+    *pos = p + 1; // skip closing quote
+    return result;
+}
+
+// Fast-path parser for mining.notify messages - avoids full cJSON DOM construction
+static bool fast_parse_mining_notify(const char *stratum_json, StratumApiV1Message *message) {
+    // Quick check for mining.notify
+    const char *notify_marker = strstr(stratum_json, "\"mining.notify\"");
+    if (!notify_marker) return false;
+    
+    // Find params array
+    const char *params_start = strstr(stratum_json, "\"params\"");
+    if (!params_start) return false;
+    
+    // Find the opening bracket of params array
+    const char *p = params_start + 8; // skip "params"
+    while (*p && *p != '[') p++;
+    if (!*p) return false;
+    p++; // skip '['
+    
+    const char *end = stratum_json + strlen(stratum_json);
+    
+    mining_notify *new_work = malloc(sizeof(mining_notify));
+    if (!new_work) return false;
+    memset(new_work, 0, sizeof(mining_notify));
+    
+    // Extract fields in order: job_id, prev_block_hash, coinbase1, coinbase2
+    new_work->job_id = fast_extract_string(&p, end);
+    new_work->prev_block_hash = fast_extract_string(&p, end);
+    new_work->coinbase_1 = fast_extract_string(&p, end);
+    new_work->coinbase_2 = fast_extract_string(&p, end);
+    
+    if (!new_work->job_id || !new_work->prev_block_hash || 
+        !new_work->coinbase_1 || !new_work->coinbase_2) {
+        goto fail;
+    }
+    
+    // Parse merkle branches array
+    while (p < end && *p != '[') p++;
+    if (p >= end) goto fail;
+    p++; // skip '['
+    
+    // Count and extract merkle branches
+    const char *merkle_start = p;
+    int n_branches = 0;
+    int bracket_depth = 1;
+    
+    // First pass: count branches
+    while (p < end && bracket_depth > 0) {
+        if (*p == '[') bracket_depth++;
+        else if (*p == ']') bracket_depth--;
+        else if (*p == '"' && bracket_depth == 1) n_branches++;
+        p++;
+    }
+    n_branches /= 2; // Each string has open and close quote
+    
+    if (n_branches > MAX_MERKLE_BRANCHES) {
+        ESP_LOGE(TAG, "Too many merkle branches: %d", n_branches);
+        goto fail;
+    }
+    
+    new_work->n_merkle_branches = n_branches;
+    new_work->merkle_branches = malloc(HASH_SIZE * n_branches);
+    if (!new_work->merkle_branches && n_branches > 0) goto fail;
+    
+    // Second pass: extract branches
+    p = merkle_start;
+    for (int i = 0; i < n_branches; i++) {
+        char *branch = fast_extract_string(&p, end);
+        if (!branch) goto fail;
+        hex2bin(branch, new_work->merkle_branches + HASH_SIZE * i, HASH_SIZE);
+        free(branch);
+    }
+    
+    // Skip to after merkle array closing bracket
+    while (p < end && *p != ']') p++;
+    if (p < end) p++;
+    
+    // Extract version, nbits, ntime (hex strings)
+    char *version_str = fast_extract_string(&p, end);
+    char *nbits_str = fast_extract_string(&p, end);
+    char *ntime_str = fast_extract_string(&p, end);
+    
+    if (!version_str || !nbits_str || !ntime_str) {
+        free(version_str);
+        free(nbits_str);
+        free(ntime_str);
+        goto fail;
+    }
+    
+    new_work->version = strtoul(version_str, NULL, 16);
+    new_work->target = strtoul(nbits_str, NULL, 16);
+    new_work->ntime = strtoul(ntime_str, NULL, 16);
+    free(version_str);
+    free(nbits_str);
+    free(ntime_str);
+    
+    // Extract clean_jobs (last param, boolean)
+    // Find "true" or "false" after ntime
+    new_work->clean_jobs = (strstr(p, "true") != NULL && strstr(p, "true") < strstr(p, "]"));
+    
+    message->method = MINING_NOTIFY;
+    message->message_id = -1; // notify messages typically have null id
+    message->mining_notification = new_work;
+    return true;
+    
+fail:
+    free(new_work->job_id);
+    free(new_work->prev_block_hash);
+    free(new_work->coinbase_1);
+    free(new_work->coinbase_2);
+    free(new_work->merkle_branches);
+    free(new_work);
+    return false;
+}
+#endif
+
 void STRATUM_V1_parse(StratumApiV1Message * message, const char * stratum_json)
 {
     ESP_LOGI(TAG, "rx: %s", stratum_json); // debug incoming stratum messages
+
+#if USE_FAST_NOTIFY_PARSER
+    // Try fast-path for mining.notify messages
+    if (fast_parse_mining_notify(stratum_json, message)) {
+        return;
+    }
+#endif
 
     cJSON * json = cJSON_Parse(stratum_json);
 
