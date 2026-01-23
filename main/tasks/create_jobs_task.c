@@ -96,7 +96,7 @@ static void generate_work(GlobalState *GLOBAL_STATE, mining_notify *notification
     uint8_t merkle_root[32];
     calculate_merkle_root_hash(coinbase_tx_hash, (uint8_t(*)[32])notification->merkle_branches, notification->n_merkle_branches, merkle_root);
 
-    bm_job *next_job = malloc(sizeof(bm_job));
+    bm_job *next_job = heap_caps_malloc(sizeof(bm_job), MALLOC_CAP_SPIRAM);
 
     if (next_job == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for new job");
