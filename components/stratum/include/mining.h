@@ -36,6 +36,6 @@ double test_nonce_value(const bm_job *job, const uint32_t nonce, const uint32_t 
 
 void extranonce_2_generate(uint64_t extranonce_2, uint32_t length, char dest[static length * 2 + 1]);
 
-uint32_t increment_bitmask(const uint32_t value, const uint32_t mask);
+uint32_t increment_bitmask(const uint32_t value, uint32_t mask);
 
 #endif /* MINING_H_ */
