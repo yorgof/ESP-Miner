@@ -6,6 +6,9 @@
 #include "mbedtls/sha256.h"
 #include "esp_log.h"
 
+// Set to 1 to use midstate optimization for nonce validation, 0 for full header hash
+#define USE_MIDSTATE_VALIDATION 1
+
 void free_bm_job(bm_job *job)
 {
     free(job->jobid);
@@ -49,6 +52,7 @@ void calculate_merkle_root_hash(const uint8_t coinbase_tx_hash[32], const uint8_
 void construct_bm_job(mining_notify *params, const uint8_t merkle_root[32], const uint32_t version_mask, const uint32_t difficulty, bm_job *new_job)
 {
     new_job->version = params->version;
+    new_job->version_mask = version_mask;
     new_job->target = params->target;
     new_job->ntime = params->ntime;
     new_job->starting_nonce = 0;
@@ -116,27 +120,98 @@ void extranonce_2_generate(uint64_t extranonce_2, uint32_t length, char dest[sta
  */
 static const double truediffone = 26959535291011309493156476344723991336010898738574164086137773096960.0;
 
+// Select the correct midstate based on rolled_version, returns NULL if no match
+static const uint8_t * select_midstate(const bm_job *job, const uint32_t rolled_version)
+{
+    if (rolled_version == job->version) {
+        return job->midstate;
+    }
+    if (job->num_midstates < 2) {
+        return NULL;
+    }
+    
+    uint32_t v = increment_bitmask(job->version, job->version_mask);
+    if (rolled_version == v) {
+        return job->midstate1;
+    }
+    if (job->num_midstates < 3) {
+        return NULL;
+    }
+    
+    v = increment_bitmask(v, job->version_mask);
+    if (rolled_version == v) {
+        return job->midstate2;
+    }
+    if (job->num_midstates < 4) {
+        return NULL;
+    }
+    
+    v = increment_bitmask(v, job->version_mask);
+    if (rolled_version == v) {
+        return job->midstate3;
+    }
+    
+    return NULL;
+}
+
 /* testing a nonce and return the diff - 0 means invalid */
 double test_nonce_value(const bm_job *job, const uint32_t nonce, const uint32_t rolled_version)
 {
-    uint8_t header[80];
-
-    // // TODO: use the midstate hash instead of hashing the whole header
-    // uint32_t rolled_version = job->version;
-    // for (int i = 0; i < midstate_index; i++) {
-    //     rolled_version = increment_bitmask(rolled_version, job->version_mask);
-    // }
-
-    // copy data from job to header
-    memcpy(header, &rolled_version, 4);
-    reverse_32bit_words(job->prev_block_hash, header + 4);
-    reverse_32bit_words(job->merkle_root, header + 36);
-    memcpy(header + 68, &job->ntime, 4);
-    memcpy(header + 72, &job->target, 4);
-    memcpy(header + 76, &nonce, 4);
-
     uint8_t hash_result[32];
-    double_sha256_bin(header, 80, hash_result);
+    
+#if USE_MIDSTATE_VALIDATION
+    // Try to use precomputed midstate for faster validation
+    const uint8_t *midstate_reversed = select_midstate(job, rolled_version);
+    
+    if (midstate_reversed != NULL) {
+        // Optimized path: continue SHA256 from midstate
+        // The midstate is stored reversed for ASIC, so un-reverse it
+        uint8_t midstate[32];
+        reverse_32bit_words(midstate_reversed, midstate);
+        
+        // Set up SHA256 context with midstate
+        mbedtls_sha256_context ctx;
+        mbedtls_sha256_init(&ctx);
+        mbedtls_sha256_starts(&ctx, 0);
+        
+        // Restore state from midstate (state is 8 x uint32_t = 32 bytes)
+        memcpy(ctx.state, midstate, 32);
+        ctx.total[0] = 64;  // 64 bytes already processed
+        ctx.total[1] = 0;
+        
+        // Build the remaining 16 bytes of header (bytes 64-79)
+        // Header layout: version(4) + prev_hash(32) + merkle_root(32) + ntime(4) + nbits(4) + nonce(4)
+        // Midstate covers bytes 0-63, so remaining is: merkle_root[28:32] + ntime + nbits + nonce
+        uint8_t remaining[16];
+        uint8_t merkle_root_unreversed[32];
+        reverse_32bit_words(job->merkle_root, merkle_root_unreversed);
+        memcpy(remaining, merkle_root_unreversed + 28, 4);  // last 4 bytes of merkle_root
+        memcpy(remaining + 4, &job->ntime, 4);
+        memcpy(remaining + 8, &job->target, 4);
+        memcpy(remaining + 12, &nonce, 4);
+        
+        // Continue hashing and finalize
+        mbedtls_sha256_update(&ctx, remaining, 16);
+        uint8_t first_hash[32];
+        mbedtls_sha256_finish(&ctx, first_hash);
+        mbedtls_sha256_free(&ctx);
+        
+        // Second SHA256
+        mbedtls_sha256(first_hash, 32, hash_result, 0);
+    } else
+#endif
+    {
+        // Full header hash path
+        uint8_t header[80];
+        memcpy(header, &rolled_version, 4);
+        reverse_32bit_words(job->prev_block_hash, header + 4);
+        reverse_32bit_words(job->merkle_root, header + 36);
+        memcpy(header + 68, &job->ntime, 4);
+        memcpy(header + 72, &job->target, 4);
+        memcpy(header + 76, &nonce, 4);
+        
+        double_sha256_bin(header, 80, hash_result);
+    }
 
     double d64 = truediffone;
     double s64 = le256todouble(hash_result);
