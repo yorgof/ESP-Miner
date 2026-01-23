@@ -124,7 +124,6 @@ typedef struct
     int extranonce_2_len;
 
     uint8_t * valid_jobs;
-    pthread_mutex_t valid_jobs_lock;
 
     uint32_t pool_difficulty;
     bool new_set_mining_difficulty_msg;

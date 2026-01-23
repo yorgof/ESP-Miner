@@ -298,10 +298,7 @@ void BM1366_send_work(void * pvParameters, bm_job * next_bm_job)
     }
 
     GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
-
-    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
     GLOBAL_STATE->valid_jobs[job.job_id] = 1;
-    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
     //debug sent jobs - this can get crazy if the interval is short
     #if BM1366_DEBUG_JOBS

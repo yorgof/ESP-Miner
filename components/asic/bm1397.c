@@ -282,10 +282,7 @@ void BM1397_send_work(void *pvParameters, bm_job *next_bm_job)
     }
 
     GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
-
-    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
     GLOBAL_STATE->valid_jobs[job.job_id] = 1;
-    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 
     #if BM1397_DEBUG_JOBS
     ESP_LOGI(TAG, "Send Job: %02X", job.job_id);
