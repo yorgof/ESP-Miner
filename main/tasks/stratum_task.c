@@ -239,11 +239,10 @@ void cleanQueue(GlobalState * GLOBAL_STATE) {
     ESP_LOGI(TAG, "Clean Jobs: clearing queue");
     queue_clear(&GLOBAL_STATE->stratum_queue);
 
-    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
-    for (int i = 0; i < 128; i = i + 4) {
+    // Clear only job IDs that are multiples of 4 (all ASIC drivers use increments divisible by 4)
+    for (int i = 0; i < 128; i += 4) {
         GLOBAL_STATE->valid_jobs[i] = 0;
     }
-    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 }
 
 void stratum_reset_uid(GlobalState * GLOBAL_STATE)
